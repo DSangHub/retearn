@@ -1,0 +1,34 @@
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+import ts from 'typescript';
+import vm from 'node:vm';
+import { webcrypto } from 'node:crypto';
+const tables={profiles:[],returns:[],events:[]};
+const schema={};for(const [name,cols] of Object.entries({profiles:['id','role','name','phone','email','address','zip','business','createdAt'],returns:['id','customerId','merchantId','driverId','merchantName','item','orderNumber','carrier','pickupDate','window','notes','status','createdAt'],events:['id','returnId','actorId','status','createdAt']})){schema[name]={table:name};for(const c of cols)schema[name][c]={name:c,table:name}}
+let user=null;
+const eq=(c,v)=>row=>row[c.name]===v,and=(...cs)=>r=>cs.every(c=>c(r)),or=(...cs)=>r=>cs.some(c=>c(r));
+const db={select:(projection)=>({from:table=>({where:async predicate=>tables[table.table].filter(predicate).map(row=>projection?Object.fromEntries(Object.entries(projection).map(([k,c])=>[k,row[c.name]])):{...row})})}),insert:table=>({values:value=>{const operation=()=>{const r={...value};if(table.table==='returns')Object.assign(r,{driverId:r.driverId??null,status:r.status??'requested'});tables[table.table].push(r);return r};return {then:resolve=>resolve(operation()),onConflictDoUpdate:async({set})=>{const row=tables[table.table].find(r=>r.id===value.id);if(row)Object.assign(row,set);else operation()}}}}),update:table=>({set:values=>({where:predicate=>({returning:async()=>{const rows=tables[table.table].filter(predicate);rows.forEach(r=>Object.assign(r,values));return rows.map(r=>({id:r.id}))}})})}),batch:ops=>Promise.all(ops)};
+const source=fs.readFileSync('app/api/platform/route.ts','utf8').replace(/^import .*;\n/gm,'');
+const js=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
+const exports={};vm.runInNewContext(js,{exports,NextResponse:{json:(value,options={})=>new Response(JSON.stringify(value),{status:options.status||200,headers:{'Content-Type':'application/json'}})},getChatGPTUser:async()=>user,getDb:()=>db,...schema,eq,and,or,crypto:webcrypto,Response,Request,URL,Date});
+const call=(body,origin='https://retern.test')=>exports.POST(new Request('https://retern.test/api/platform',{method:'POST',headers:{origin,'Content-Type':'application/json'},body:JSON.stringify(body)}));
+assert.equal((await call({action:'profile'})).status,401);
+for(const [id,role] of [['customer','customer'],['driver','driver'],['driver2','driver'],['merchant','merchant'],['stranger','customer']]){user={userId:id,email:id+'@example.test'};assert.equal((await call({action:'profile',role,name:id,phone:'555-0100',address:id+' address',zip:'93701',business:'Test Store'})).status,200)}
+user={userId:'customer',email:'customer@example.test'};
+assert.equal((await call({action:'profile',role:'driver',name:'Customer',phone:'555-0100',address:'Private address',zip:'93701'})).status,200);
+assert.equal(tables.profiles[0].role,'customer','Role cannot be escalated');
+const request={action:'request',merchantId:'merchant',merchantName:'Test Store',item:'Return item',orderNumber:'PRIVATE-ORDER',carrier:'UPS',pickupDate:'2099-10-10',window:'9am – 12pm',notes:'Private entry instructions',prepared:'on'};
+assert.equal((await call({...request,prepared:false})).status,400);
+assert.equal((await call({...request,pickupDate:'2099-02-31'})).status,400);
+assert.equal((await call(request,'https://hostile.test')).status,403);
+const response=await call(request);assert.equal(response.status,200);const {id}=await response.json();
+user={userId:'stranger',email:'stranger@example.test'};assert.equal((await exports.GET()).status,200);assert.equal((await (await exports.GET()).json()).returns.length,0);assert.equal((await call({action:'cancel',id})).status,403);
+user={userId:'driver',email:'driver@example.test'};
+let viewed=(await (await exports.GET()).json()).returns[0];assert.equal(viewed.pickup,null);assert.equal(viewed.notes,'');assert.equal(viewed.orderNumber,'');
+assert.equal((await call({action:'claim',id})).status,200);
+viewed=(await (await exports.GET()).json()).returns[0];assert.equal(viewed.pickup.address,'Private address');
+user={userId:'driver2',email:'driver2@example.test'};assert.equal((await call({action:'claim',id})).status,403);assert.equal((await call({action:'status',id})).status,403);
+user={userId:'merchant',email:'merchant@example.test'};assert.equal((await call({action:'receive',id})).status,403);viewed=(await (await exports.GET()).json()).returns[0];assert.equal(viewed.pickup,null);
+user={userId:'driver',email:'driver@example.test'};assert.equal((await call({action:'status',id})).status,200);assert.equal(tables.returns[0].status,'picked_up');assert.equal((await call({action:'status',id})).status,200);assert.equal(tables.returns[0].status,'dropped_off');
+user={userId:'merchant',email:'merchant@example.test'};assert.equal((await call({action:'receive',id})).status,200);assert.equal(tables.returns[0].status,'received');assert.equal(tables.events.length,5);
+console.log('Passed: authentication, role immutability, input validation, request isolation, address privacy, ownership, duplicate claim prevention and complete return lifecycle.');
